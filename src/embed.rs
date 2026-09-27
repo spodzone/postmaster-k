@@ -57,15 +57,26 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Feature-hash `tokens` into a dims-vector and L2-normalize it.
-/// Returns a zero vector (norm 0) when there are no tokens.
-pub fn embed_tokens(tokens: impl Iterator<Item = String>, dims: usize) -> Vec<f32> {
+/// Per-token occurrence counts for one message. Shared by the embedder
+/// and by the per-category term tables (SPEC §7.2).
+pub fn token_counts(tokens: impl Iterator<Item = String>) -> HashMap<String, u32> {
     let mut counts: HashMap<String, u32> = HashMap::new();
     for t in tokens {
         *counts.entry(t).or_insert(0) += 1;
     }
+    counts
+}
+
+/// Feature-hash `tokens` into a dims-vector and L2-normalize it.
+/// Returns a zero vector (norm 0) when there are no tokens.
+pub fn embed_tokens(tokens: impl Iterator<Item = String>, dims: usize) -> Vec<f32> {
+    embed_counts(&token_counts(tokens), dims)
+}
+
+/// Feature-hash pre-aggregated token counts (SPEC §7 steps 2-4).
+pub fn embed_counts(counts: &HashMap<String, u32>, dims: usize) -> Vec<f32> {
     let mut v = vec![0f32; dims];
-    for (tok, count) in &counts {
+    for (tok, count) in counts {
         let (h_bucket, h_sign) = fnv1a_with_salt(tok);
         let bucket = (h_bucket % dims as u64) as usize;
         let sign = if h_sign & 1 == 0 { -1.0 } else { 1.0 };
