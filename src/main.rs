@@ -43,14 +43,13 @@ enum Command {
         /// Message file; stdin when omitted
         file: Option<PathBuf>,
     },
-    /// Show top terms recorded for a category
+    /// Show top terms recorded for a category (or all categories when omitted)
     Analytics {
-        /// Category to report (--all for every configured category)
-        #[arg(required_unless_present = "all")]
+        /// Category to report; omitted means all categories
         category: Option<String>,
         #[arg(short = 'n', long, default_value_t = 20)]
         n: usize,
-        /// Report every configured category
+        /// Report every configured category (overrides category if present)
         #[arg(long, conflicts_with = "category")]
         all: bool,
     },
@@ -82,12 +81,15 @@ fn main() {
             };
             std::process::exit(postmaster_k::infer::run(&home, mode, file.as_deref()));
         }
-        Command::Analytics { category, n, all } => run(postmaster_k::analytics::run(
-            &home,
-            category.as_deref(),
-            n,
-            all,
-        )),
+        Command::Analytics { category, n, all } => {
+            // If no specific category is given and --all not set, default to all categories.
+            let (cat_opt, all_flag) = if category.is_none() && !all {
+                (None, true)
+            } else {
+                (category.as_deref(), all)
+            };
+            run(postmaster_k::analytics::run(&home, cat_opt, n, all_flag))
+        }
     }
 }
 
