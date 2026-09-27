@@ -17,7 +17,7 @@ pub fn run(home: &Path, category: Option<&str>, n: usize, all: bool) -> Result<S
     } else {
         // clap guarantees exactly one of category/--all.
         let cat = config::normalize_category(category.expect("clap enforces category or --all"))?;
-        if !settings.categories.iter().any(|c| *c == cat) {
+        if !settings.categories.contains(&cat) {
             let known = if settings.categories.is_empty() {
                 "none".to_string()
             } else {
