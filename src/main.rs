@@ -45,11 +45,13 @@ enum Command {
     },
     /// Show top terms recorded for a category
     Analytics {
+        /// Category to report (--all for every configured category)
+        #[arg(required_unless_present = "all")]
         category: Option<String>,
         #[arg(short = 'n', long, default_value_t = 20)]
         n: usize,
         /// Report every configured category
-        #[arg(long)]
+        #[arg(long, conflicts_with = "category")]
         all: bool,
     },
 }
@@ -80,10 +82,12 @@ fn main() {
             };
             std::process::exit(postmaster_k::infer::run(&home, mode, file.as_deref()));
         }
-        Command::Analytics { category, n, all } => {
-            let _ = (category, n, all);
-            not_implemented("analytics")
-        }
+        Command::Analytics { category, n, all } => run(postmaster_k::analytics::run(
+            &home,
+            category.as_deref(),
+            n,
+            all,
+        )),
     }
 }
 
@@ -95,9 +99,4 @@ fn run(result: Result<String, String>) {
             std::process::exit(2);
         }
     }
-}
-
-fn not_implemented(cmd: &str) {
-    eprintln!("postmaster-k: `{cmd}` is not implemented yet");
-    std::process::exit(2);
 }
