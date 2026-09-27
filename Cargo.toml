@@ -10,6 +10,7 @@ clap = { version = "4", features = ["derive"] }
 mail-parser = "0.11"
 toml_edit = "0.23"
 usearch = "2"
+rand = "0.9"
 
 [profile.release]
 # SPEC §10: small, fast, static-friendly release binary.

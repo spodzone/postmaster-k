@@ -53,6 +53,11 @@ enum Command {
         #[arg(long, conflicts_with = "category")]
         all: bool,
     },
+    /// Sample a Maildir and grid-search threshold / threshold_factor
+    Autocalibrate {
+        /// Maildir root: each subdirectory is a category of message files
+        maildir: PathBuf,
+    },
 }
 
 fn main() {
@@ -89,6 +94,17 @@ fn main() {
                 (category.as_deref(), all)
             };
             run(postmaster_k::analytics::run(&home, cat_opt, n, all_flag))
+        }
+        Command::Autocalibrate { maildir } => {
+            match postmaster_k::autocalibrate::run(&maildir, &home) {
+                Ok((t, f)) => {
+                    println!(
+                        "postmaster-k: best parameters — threshold = {}, factor = {}",
+                        t, f
+                    );
+                }
+                Err(e) => eprintln!("postmaster-k: {e}"),
+            }
         }
     }
 }

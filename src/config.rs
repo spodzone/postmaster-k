@@ -214,6 +214,24 @@ fn save_document(loaded: &Loaded) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e}", loaded.path.display()))
 }
 
+/// Update the scalar value of `key` in config.toml in-place. The key must
+/// already exist as a simple `key = value` line; comments and other keys are
+/// left untouched. Edits go through toml_edit so user formatting survives.
+pub fn update_float(home: &Path, key: &str, value: f64) -> Result<(), String> {
+    let mut loaded = load_document(home)?;
+    match loaded.doc.get_mut(key) {
+        Some(Item::None) | None => {
+            // Key doesn't exist yet — append it.
+            let val: Value = value.into();
+            loaded.doc.insert(key, Item::Value(val));
+        }
+        Some(item) => {
+            *item = Item::Value(value.into());
+        }
+    }
+    save_document(&loaded)
+}
+
 /// `postmaster-k init` — scaffold the state root and a default config.toml.
 /// Idempotent: an existing config is left untouched.
 pub fn init(home: &Path) -> Result<String, String> {

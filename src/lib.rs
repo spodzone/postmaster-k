@@ -1,6 +1,7 @@
 //! postmaster-k — multi-category, dynamically-learning email classifier for procmail.
 
 pub mod analytics;
+pub mod autocalibrate;
 pub mod config;
 pub mod embed;
 pub mod infer;

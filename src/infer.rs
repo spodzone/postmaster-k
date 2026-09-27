@@ -177,7 +177,7 @@ fn open_view(index_path: &Path, dims: usize) -> Result<Index, InferError> {
 /// order so the result is deterministic for a given index state (§6 steps 5–6).
 /// The winner must also have a weight at least `threshold_factor` times the
 /// second-greatest, enforcing a hockey-stick drop-off.
-fn vote(
+pub(crate) fn vote(
     labels: &[store::LabelEntry],
     keys: &[u64],
     distances: &[f32],
@@ -214,7 +214,9 @@ fn vote(
     votes.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     votes.reverse();
     let best_w = votes[0].1;
-    let second_w = votes[1].1;
+    // With only one category represented in the vote, there is no rival to
+    // compare against — the winner is unambiguous.
+    let second_w = votes.get(1).map(|(_, w)| *w).unwrap_or(best_w);
     let share = best_w / total;
     if share < threshold || best_w < second_w * threshold_factor {
         Verdict {
