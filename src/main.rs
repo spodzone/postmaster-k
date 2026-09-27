@@ -57,8 +57,16 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
 
+    let home = match postmaster_k::config::resolve_home(cli.home.as_deref()) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("postmaster-k: {e}");
+            std::process::exit(2);
+        }
+    };
+
     match cli.command {
-        Command::Init => not_implemented("init"),
+        Command::Init => run(postmaster_k::config::init(&home)),
         Command::Learn { category, source } => {
             let _ = (category, source);
             not_implemented("learn")
@@ -70,6 +78,16 @@ fn main() {
         Command::Analytics { category, n, all } => {
             let _ = (category, n, all);
             not_implemented("analytics")
+        }
+    }
+}
+
+fn run(result: Result<String, String>) {
+    match result {
+        Ok(msg) => println!("{msg}"),
+        Err(e) => {
+            eprintln!("postmaster-k: {e}");
+            std::process::exit(2);
         }
     }
 }
