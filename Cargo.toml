@@ -1,0 +1,29 @@
+[package]
+name = "postmaster-k"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-category, dynamically-learning email classifier for procmail — single binary, mmap-backed kNN over feature-hashed embeddings"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+mail-parser = "0.11"
+toml_edit = "0.23"
+usearch = "2"
+
+[profile.release]
+# SPEC §10: small, fast, static-friendly release binary.
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# The dev profile deliberately mirrors the release settings so that a plain
+# `cargo build` already produces the optimized, stripped hot-path binary.
+[profile.dev]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+debug = false
+incremental = false
