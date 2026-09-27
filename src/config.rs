@@ -10,6 +10,7 @@ use toml_edit::{DocumentMut, Item, Value};
 pub const DEFAULT_DIMS: usize = 2048;
 pub const DEFAULT_K: usize = 15;
 pub const DEFAULT_THRESHOLD: f64 = 0.4;
+pub const DEFAULT_THRESHOLD_FACTOR: f64 = 2.0;
 
 const CONFIG_FILE: &str = "config.toml";
 
@@ -25,6 +26,10 @@ k = 15
 
 # Vote share a category must reach to avoid `unsure` (SPEC §6).
 threshold = 0.4
+
+# The winner's vote weight must be at least this many times the second-greatest
+# to avoid `unsure`. Enforces a hockey-stick drop-off in likelihoods (default 2.0).
+threshold_factor = 2.0
 "#;
 
 pub fn index_path(home: &Path) -> PathBuf {
@@ -130,6 +135,7 @@ pub struct Settings {
     pub dims: usize,
     pub k: usize,
     pub threshold: f64,
+    pub threshold_factor: f64,
     pub categories: Vec<String>,
 }
 
@@ -151,6 +157,7 @@ pub fn settings(home: &Path) -> Result<Settings, String> {
         dims: get_usize(&loaded.doc, "dims", DEFAULT_DIMS)?,
         k: get_usize(&loaded.doc, "k", DEFAULT_K)?,
         threshold: get_f64(&loaded.doc, "threshold", DEFAULT_THRESHOLD)?,
+        threshold_factor: get_f64(&loaded.doc, "threshold_factor", DEFAULT_THRESHOLD_FACTOR)?,
         categories,
     };
     if s.dims < 64 || s.dims > (1 << 20) {
@@ -161,6 +168,9 @@ pub fn settings(home: &Path) -> Result<Settings, String> {
     }
     if !(0.0..=1.0).contains(&s.threshold) {
         return Err("config key `threshold` must be between 0.0 and 1.0".into());
+    }
+    if s.threshold_factor <= 1.0 {
+        return Err("config key `threshold_factor` must be greater than 1.0".into());
     }
     Ok(s)
 }
@@ -252,6 +262,7 @@ mod tests {
         assert_eq!(s.dims, 2048);
         assert_eq!(s.k, 15);
         assert!((s.threshold - 0.4).abs() < 1e-9);
+        assert!((s.threshold_factor - 2.0).abs() < 1e-9);
         assert!(s.categories.is_empty());
         let _ = fs::remove_dir_all(&home);
     }

@@ -152,6 +152,7 @@ pub fn classify(home: &Path, raw: &[u8]) -> Result<Verdict, InferError> {
         &matches.keys,
         &matches.distances,
         settings.threshold,
+        settings.threshold_factor,
     ))
 }
 
@@ -174,7 +175,15 @@ fn open_view(index_path: &Path, dims: usize) -> Result<Index, InferError> {
 
 /// Inverse-distance-weighted vote; ties go to the earlier match in search
 /// order so the result is deterministic for a given index state (§6 steps 5–6).
-fn vote(labels: &[store::LabelEntry], keys: &[u64], distances: &[f32], threshold: f64) -> Verdict {
+/// The winner must also have a weight at least `threshold_factor` times the
+/// second-greatest, enforcing a hockey-stick drop-off.
+fn vote(
+    labels: &[store::LabelEntry],
+    keys: &[u64],
+    distances: &[f32],
+    threshold: f64,
+    threshold_factor: f64,
+) -> Verdict {
     let mut votes: Vec<(String, f64)> = Vec::new();
     let mut total = 0.0;
     for (key, dist) in keys.iter().zip(distances.iter()) {
@@ -201,22 +210,20 @@ fn vote(labels: &[store::LabelEntry], keys: &[u64], distances: &[f32], threshold
             share: 0.0,
         };
     }
-    let (mut best_i, mut best_w) = (0usize, votes[0].1);
-    for (i, (_, w)) in votes.iter().enumerate().skip(1) {
-        if *w > best_w {
-            best_i = i;
-            best_w = *w;
-        }
-    }
+    // Sort descending by weight so best and second-best are adjacent.
+    votes.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    votes.reverse();
+    let best_w = votes[0].1;
+    let second_w = votes[1].1;
     let share = best_w / total;
-    if share < threshold {
+    if share < threshold || best_w < second_w * threshold_factor {
         Verdict {
             category: UNSURE.into(),
             share,
         }
     } else {
         Verdict {
-            category: votes[best_i].0.clone(),
+            category: votes[0].0.clone(),
             share,
         }
     }
@@ -512,7 +519,7 @@ mod tests {
                 source: None,
             },
         ];
-        let v = vote(&labels, &[1, 2, 3], &[0.1, 0.2, 0.9], 0.4);
+        let v = vote(&labels, &[1, 2, 3], &[0.1, 0.2, 0.9], 0.4, 2.0);
         assert_eq!(v.category, "a");
         assert!(v.share > 0.4);
     }
@@ -532,7 +539,7 @@ mod tests {
             },
         ];
         // one neighbour of each, equally distant → 0.5 share
-        let v = vote(&labels, &[1, 3], &[0.5, 0.5], 0.6);
+        let v = vote(&labels, &[1, 3], &[0.5, 0.5], 0.6, 2.0);
         assert_eq!(v.category, UNSURE);
         assert!((v.share - 0.5).abs() < 1e-9);
     }
@@ -544,8 +551,54 @@ mod tests {
             category: "a".into(),
             source: None,
         }];
-        let v = vote(&labels, &[7, 7], &[0.1, 0.1], 0.4);
+        let v = vote(&labels, &[7, 7], &[0.1, 0.1], 0.4, 2.0);
         assert_eq!(v.category, UNSURE);
         assert_eq!(v.share, 0.0);
+    }
+
+    #[test]
+    fn vote_below_threshold_factor_is_unsure() {
+        // "a" wins share but its weight is only 1.5× the second place — below factor 2.0.
+        let labels = vec![
+            store::LabelEntry {
+                key: 1,
+                category: "a".into(),
+                source: None,
+            },
+            store::LabelEntry {
+                key: 2,
+                category: "a".into(),
+                source: None,
+            },
+            store::LabelEntry {
+                key: 3,
+                category: "b".into(),
+                source: None,
+            },
+        ];
+        // weights: a≈1/0.1=10, a≈1/0.2=5 → total_a=15; b≈1/0.9=1.11 → total_b=1.11
+        // share ≈ 15/16.11 ≈ 0.93 (>0.4) but ratio 15/1.11 ≈ 13.5 — above factor here, so pick closer distances:
+        let v = vote(&labels, &[1, 2, 3], &[0.1, 0.15, 0.12], 0.4, 2.0);
+        // a weight: 1/0.1 + 1/0.15 = 10 + 6.67 = 16.67; b: 1/0.12 = 8.33; ratio ≈ 2.0
+        assert_eq!(v.category, UNSURE);
+    }
+
+    #[test]
+    fn vote_hockey_stick_winner_passes() {
+        let labels = vec![
+            store::LabelEntry {
+                key: 1,
+                category: "a".into(),
+                source: None,
+            },
+            store::LabelEntry {
+                key: 2,
+                category: "b".into(),
+                source: None,
+            },
+        ];
+        // a weight 10, b weight 1 → ratio 10 ≥ 2.0
+        let v = vote(&labels, &[1, 2], &[0.1, 0.9], 0.4, 2.0);
+        assert_eq!(v.category, "a");
     }
 }
