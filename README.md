@@ -31,6 +31,18 @@ The name comes from a memorable scene in **Truro, Massachusetts** (if you know, 
   postmaster-k analytics invoices -n 20
   ```
 
+### Calibrating
+
+- **`autocalibrate <maildir>`** – Grid‑search the confidence parameters against real data and write the best pair into `config.toml`.  The argument is a Maildir‑style root where **each subdirectory is a category** and the files within it are messages.
+
+  A random sample of `max(20%, 200)` messages per category is classified, then every combination of `threshold` (0.0 → 0.6, step 0.1) and `threshold_factor` (1.0 → 5.0, step 0.25) is scored.  A markdown table of `(threshold, factor, %correct)` is printed, and the **lowest** threshold/factor pair that reaches maximum accuracy is written back to `config.toml`.
+
+  ```sh
+  postmaster-k autocalibrate ~/mail/sorted/
+  ```
+
+  Requires the categories to have been `learn`-ed first — autocalibrate scores against the existing index, it does not modify it.
+
 ### Inference
 
 - **`infer [--mode=word|header|full] [file]`** – Classify a single message.
@@ -72,6 +84,32 @@ CATEGORY=`formail -c | postmaster-k infer --mode=word`
 * CATEGORY ?? ^invoices$
 Mail/invoices/
 ```
+
+## Configuration
+
+Settings live in `config.toml` at the state root (`~/.postmaster-k/` by default).  `learn` appends to `categories` automatically; the other keys can be edited by hand or tuned with `autocalibrate`.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `categories` | `[]` | Known categories; maintained automatically by `learn`. |
+| `dims` | `2048` | Feature‑hash dimensionality. |
+| `k` | `15` | Neighbours consulted per inference. |
+| `threshold` | `0.4` | Vote share the winning category must reach to avoid `unsure`. |
+| `threshold_factor` | `2.0` | Hockey‑stick criterion: the winner's vote weight must be at least this many times the runner-up. |
+
+### `threshold`
+
+The winner's share of the total vote weight (0.0–1.0).  A result below this is classed `unsure` rather than delivered to a category.  Raise it to send more ambiguous mail to manual sorting; lower it if too much mail ends up in `unsure`.
+
+### `threshold_factor`
+
+Share alone can be misleading: a 0.6 share produced by a 0.6/0.4 split between two categories is a coin‑flip, while a 0.6 share from a 0.6/0.05 split is a clear winner.  `threshold_factor` enforces the latter shape — the categories are effectively ordered by likelihood, and the greatest must be at least `threshold_factor` times the second‑greatest (a hockey‑stick / exponential drop‑off), otherwise the result is `unsure`.
+
+* `2.0` (default) – the winner must have double the runner‑up's weight.
+* Close to `1.0` – trust the share alone; `threshold_factor = 1.0` disables the criterion.
+* High values (3–5) – only near‑unanimous votes classify; everything else falls to `unsure`.
+
+Both parameters interact, so tune them together — `autocalibrate` does exactly that by scoring a sample of your real mail across the grid and picking the least conservative pair that keeps accuracy at its maximum.
 
 ---
 
