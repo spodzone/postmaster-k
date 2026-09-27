@@ -73,8 +73,12 @@ fn main() {
             source.as_deref(),
         )),
         Command::Infer { mode, file } => {
-            let _ = (mode, file);
-            not_implemented("infer")
+            let mode = match mode {
+                Mode::Word => postmaster_k::infer::Mode::Word,
+                Mode::Header => postmaster_k::infer::Mode::Header,
+                Mode::Full => postmaster_k::infer::Mode::Full,
+            };
+            std::process::exit(postmaster_k::infer::run(&home, mode, file.as_deref()));
         }
         Command::Analytics { category, n, all } => {
             let _ = (category, n, all);
