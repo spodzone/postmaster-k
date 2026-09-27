@@ -2,5 +2,6 @@
 
 pub mod config;
 pub mod embed;
+pub mod learn;
 pub mod store;
 pub mod text;

@@ -67,10 +67,11 @@ fn main() {
 
     match cli.command {
         Command::Init => run(postmaster_k::config::init(&home)),
-        Command::Learn { category, source } => {
-            let _ = (category, source);
-            not_implemented("learn")
-        }
+        Command::Learn { category, source } => run(postmaster_k::learn::run(
+            &home,
+            &category,
+            source.as_deref(),
+        )),
         Command::Infer { mode, file } => {
             let _ = (mode, file);
             not_implemented("infer")
