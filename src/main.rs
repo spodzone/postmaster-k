@@ -42,6 +42,10 @@ enum Command {
         mode: Mode,
         /// Message file; stdin when omitted
         file: Option<PathBuf>,
+        /// Reinforce the verdict: learn this message under the winning
+        /// category (no-op when the verdict is `unsure`)
+        #[arg(long)]
+        learn: bool,
     },
     /// Show top terms recorded for a category (or all categories when omitted)
     Analytics {
@@ -78,13 +82,18 @@ fn main() {
             &category,
             source.as_deref(),
         )),
-        Command::Infer { mode, file } => {
+        Command::Infer { mode, file, learn } => {
             let mode = match mode {
                 Mode::Word => postmaster_k::infer::Mode::Word,
                 Mode::Header => postmaster_k::infer::Mode::Header,
                 Mode::Full => postmaster_k::infer::Mode::Full,
             };
-            std::process::exit(postmaster_k::infer::run(&home, mode, file.as_deref()));
+            std::process::exit(postmaster_k::infer::run(
+                &home,
+                mode,
+                learn,
+                file.as_deref(),
+            ));
         }
         Command::Analytics { category, n, all } => {
             // If no specific category is given and --all not set, default to all categories.

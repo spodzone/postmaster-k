@@ -2,7 +2,7 @@
 //! root, exercising the SPEC §6/§8/§2 semantics (separation, threshold,
 //! fail-open, byte-exact full-mode passthrough).
 
-use postmaster_k::{config, infer, learn};
+use postmaster_k::{config, infer, learn, store};
 use std::fs;
 use std::path::Path;
 
@@ -231,4 +231,56 @@ fn dims_mismatch_is_soft_failure_and_fails_open() {
         other => panic!("expected Soft, got {other:?}"),
     }
     assert_eq!(infer::full_output(&home, raw), raw.to_vec());
+}
+
+#[test]
+fn infer_learn_reinforces_winning_category() {
+    let home = temp_home("infer-learn");
+    config::init(&home).unwrap();
+    // Low threshold_factor so the verdict is a clean `invoices`.
+    set_config_value(&home, "threshold_factor", "1.1");
+    seed(&home);
+
+    let before = store::load_labels(&config::labels_path(&home))
+        .unwrap()
+        .len();
+
+    let msg = home.join("query.eml");
+    fs::write(&msg, INVOICE_QUERY).unwrap();
+    assert_eq!(infer::run(&home, infer::Mode::Word, true, Some(&msg)), 0);
+
+    // One new label entry, tagged with the category infer just chose.
+    let labels = store::load_labels(&config::labels_path(&home)).unwrap();
+    assert_eq!(labels.len(), before + 1, "--learn must add one vector");
+    assert_eq!(labels.last().unwrap().category, "invoices");
+
+    // And the index still classifies correctly afterwards.
+    assert_eq!(
+        infer::classify(&home, INVOICE_QUERY).unwrap().category,
+        "invoices"
+    );
+}
+
+#[test]
+fn infer_learn_skips_unsure() {
+    let home = temp_home("infer-learn-unsure");
+    config::init(&home).unwrap();
+    seed(&home);
+    // Force every verdict to `unsure`.
+    set_config_value(&home, "threshold", "1.0");
+
+    let before = store::load_labels(&config::labels_path(&home))
+        .unwrap()
+        .len();
+
+    let msg = home.join("query.eml");
+    fs::write(&msg, INVOICE_QUERY).unwrap();
+    assert_eq!(infer::run(&home, infer::Mode::Word, true, Some(&msg)), 0);
+
+    let labels = store::load_labels(&config::labels_path(&home)).unwrap();
+    assert_eq!(
+        labels.len(),
+        before,
+        "an `unsure` verdict must not be learned"
+    );
 }

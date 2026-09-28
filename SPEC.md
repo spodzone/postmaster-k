@@ -211,8 +211,8 @@ postmaster-k learn invoices ~/mail-examples/invoices/
 ### `postmaster-k infer [--mode=word|header|full] [file]`
 
 Reads a single message from `<file>` if given, else from stdin. Always the
-hot path from `.procmailrc` — must open the index in `view()` (mmap) mode
-only, never `load()`.
+hot path from `.procmailrc` — classification must open the index in `view()`
+(mmap) mode only, never `load()`.
 
 - `--mode=word` *(default)* — prints exactly one word: the winning category
   name (or `unsure`). Intended for `:0` recipe conditionals.
@@ -223,6 +223,13 @@ only, never `load()`.
   otherwise-untouched** message back out to stdout. This is the mode used
   when Postmaster-K sits directly in a procmail pipe as the thing that
   produces the message procmail actually delivers.
+- `--learn` — after a **non-`unsure`** verdict, feeds the message back
+  through the `learn` path under the category just chosen, so the classifier
+  reinforces itself as mail flows. The reinforcement happens strictly *after*
+  the verdict is emitted (the fresh vector can never influence its own
+  classification), `unsure` verdicts are never learned, and a failed learn is
+  only a stderr warning — it never alters the classification output or the
+  exit code. Only this step opens the index in mutable `load()` mode.
 
 On any internal error (parse failure, corrupt index, embedding failure):
 `--mode=word` prints `unsure` and exits 0; `--mode=header` prints nothing and

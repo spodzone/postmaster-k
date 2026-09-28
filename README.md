@@ -89,6 +89,7 @@ postmaster-k autocalibrate ~/mail/sorted/
 - `--mode=word` *(default)* — prints exactly one word: the winning category, or `unsure`.
 - `--mode=header` — prints a single header line, e.g. `X-Postmaster-K-Category: invoices`.
 - `--mode=full` — emits the complete, otherwise‑untouched message with the `X-Postmaster-K-Category:` header inserted.
+- `--learn` — after a non‑`unsure` verdict, feeds the message back through `learn` under the category just chosen, so the classifier reinforces itself as mail flows (an `unsure` verdict is never learned; a learn failure is only a stderr warning and never affects output or the exit code). Classification itself still uses the read‑only mmap path — the reinforcement step opens the index mutably only after the verdict has been emitted.
 
 Pipe a message through it to try it by hand:
 

@@ -1,13 +1,16 @@
 //! The `infer` subcommand — the procmail hot path (SPEC §6, §8, §9).
 //!
-//! The index is always opened in mmap `view()` mode here; mutable `load()`
-//! is reserved for `learn`. Classification is inverse-distance-weighted
-//! k-NN voting with a confidence threshold. Every failure path fails open
-//! (SPEC §2): the message is passed through untouched rather than lost.
-//! Non-zero exit is reserved for genuine misuse (unreadable input, missing
-//! state), never for "couldn't classify this particular email".
+//! Classification always opens the index in mmap `view()` mode; mutable
+//! `load()` is reserved for `learn`, including `--learn`'s reinforcement
+//! step, which runs only *after* the verdict is emitted (so the fresh
+//! vector can never influence its own classification). Classification is
+//! inverse-distance-weighted k-NN voting with a confidence threshold.
+//! Every failure path fails open (SPEC §2): the message is passed through
+//! untouched rather than lost. Non-zero exit is reserved for genuine misuse
+//! (unreadable input, missing state), never for "couldn't classify this
+//! particular email".
 
-use crate::{config, embed, store, text};
+use crate::{config, embed, learn, store, text};
 use std::io::{Read, Write};
 use std::path::Path;
 use usearch::Index;
@@ -52,8 +55,13 @@ impl std::fmt::Display for InferError {
     }
 }
 
-/// Classify one message and emit it per `mode`. Returns the process exit code.
-pub fn run(home: &Path, mode: Mode, file: Option<&Path>) -> i32 {
+/// Classify one message and emit it per `mode`. When `learn` is set, the
+/// message is then fed back into the `learn` cycle under the winning
+/// category (`unsure` verdicts are never reinforced). Reinforcement is
+/// silent — the only output is what `mode` produces; a learn failure is a
+/// lone stderr warning and never affects the output or exit code. Returns
+/// the process exit code.
+pub fn run(home: &Path, mode: Mode, learn: bool, file: Option<&Path>) -> i32 {
     // Without the input bytes there is nothing to fail open with, so a read
     // error is the one failure that exits non-zero in every mode.
     let raw = match read_input(file) {
@@ -70,6 +78,11 @@ pub fn run(home: &Path, mode: Mode, file: Option<&Path>) -> i32 {
                 Mode::Word => print_line(&v.category),
                 Mode::Header => print_line(&format!("X-Postmaster-K-Category: {}", v.category)),
                 Mode::Full => write_stdout(&tag_message(&raw, &v.category, v.share)),
+            }
+            if learn && v.category != UNSURE {
+                if let Err(e) = learn::run_from_bytes(home, &v.category, &raw) {
+                    eprintln!("postmaster-k: --learn: {e}");
+                }
             }
             0
         }

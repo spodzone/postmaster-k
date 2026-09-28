@@ -4,10 +4,10 @@
 //! extract text (§7.1), tokenize + feature-hash (§7), insert into the
 //! usearch index with a fresh key, tag the key in `labels.db`, and fold
 //! the tokens into `terms/<category>.db`. The index is opened in mutable
-//! `load()` mode — this is the ONLY subcommand allowed to do that; `infer`
-//! stays mmap-view-only. Nothing is persisted until the whole batch
-//! parsed+embedded cleanly, so a failed `learn` leaves the previous state
-//! intact.
+//! `load()` mode — this is the ONLY module allowed to do that; `infer`
+//! stays mmap-view-only except for `--learn`'s reinforcement step, which
+//! delegates here. Nothing is persisted until the whole batch parsed+
+//! embedded cleanly, so a failed `learn` leaves the previous state intact.
 
 use crate::{config, embed, store, text};
 use std::fs;
@@ -26,17 +26,7 @@ pub fn run(home: &Path, category: &str, source: Option<&str>) -> Result<String, 
     let source = source.unwrap_or("-");
 
     let dims = config::settings(home)?.dims;
-
-    let mut st = LearnState {
-        labels: store::load_labels(&config::labels_path(home))
-            .map_err(|e| format!("cannot read {}: {e}", config::labels_path(home).display()))?,
-        terms: store::load_terms(&config::terms_path(home, &cat))
-            .map_err(|e| format!("cannot read term table: {e}"))?,
-        next_key: 0,
-        learned: 0,
-        skipped: 0,
-    };
-    st.next_key = store::next_key(&st.labels);
+    let mut st = init_state(home, &cat)?;
 
     let (files, from_stdin) = match source {
         "-" => {
@@ -89,18 +79,59 @@ pub fn run(home: &Path, category: &str, source: Option<&str>) -> Result<String, 
         ));
     }
 
+    persist(home, &cat, &index, &st)
+}
+
+/// Learn one already-in-hand raw message into `category` — the stdin branch
+/// of `run` without touching stdin. This is what `infer --learn` calls after
+/// a non-`unsure` verdict to reinforce the classification.
+pub fn run_from_bytes(home: &Path, category: &str, raw: &[u8]) -> Result<String, String> {
+    let cat = config::normalize_category(category)?;
+    let dims = config::settings(home)?.dims;
+    let mut st = init_state(home, &cat)?;
+
+    let index = open_for_learning(&config::index_path(home), dims, 1 + SLACK)?;
+    ingest(&index, raw, None, &cat, dims, &mut st)?;
+
+    if st.learned == 0 {
+        return Err(format!(
+            "no usable message found for category `{cat}`; nothing was written"
+        ));
+    }
+
+    persist(home, &cat, &index, &st)
+}
+
+/// Load labels.db + the category's term table and pick the next free key.
+fn init_state(home: &Path, cat: &str) -> Result<LearnState, String> {
+    let mut st = LearnState {
+        labels: store::load_labels(&config::labels_path(home))
+            .map_err(|e| format!("cannot read {}: {e}", config::labels_path(home).display()))?,
+        terms: store::load_terms(&config::terms_path(home, cat))
+            .map_err(|e| format!("cannot read term table: {e}"))?,
+        next_key: 0,
+        learned: 0,
+        skipped: 0,
+    };
+    st.next_key = store::next_key(&st.labels);
+    Ok(st)
+}
+
+/// Persist one completed learn batch: register the category, save the index
+/// (tmp+rename), then the side-tables. Returns the human summary.
+fn persist(home: &Path, cat: &str, index: &Index, st: &LearnState) -> Result<String, String> {
     // Register the category only once learning actually produced something.
-    if config::add_category(home, &cat)? {
+    if config::add_category(home, cat)? {
         eprintln!("postmaster-k: created category `{cat}`");
     }
 
     // Persist: index first (tmp+rename), then side-tables. If a side-table
     // write fails, the index may briefly contain unlabelled vectors;
     // `infer` skips unknown keys with a warning instead of guessing.
-    save_index(&index, &config::index_path(home))?;
+    save_index(index, &config::index_path(home))?;
     store::store_labels(&config::labels_path(home), &st.labels)
         .map_err(|e| format!("cannot write {}: {e}", config::labels_path(home).display()))?;
-    store::store_terms(&config::terms_path(home, &cat), &st.terms)
+    store::store_terms(&config::terms_path(home, cat), &st.terms)
         .map_err(|e| format!("cannot write term table: {e}"))?;
 
     Ok(format!(
