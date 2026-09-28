@@ -12,12 +12,18 @@ use rand::seq::SliceRandom;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 /// Minimum sample size per category so small Maildirs still get enough data.
 const MIN_SAMPLES: usize = 200;
 
 /// Default fraction of each category to sample when the category is large.
 const SAMPLE_FRACTION: f64 = 0.20;
+
+/// Number of grid-search evaluations to run concurrently.
+const PARALLEL_JOBS: usize = 5;
 
 /// Grid step for `threshold`: 0.0, 0.1, …, 0.6.
 const THRESHOLD_STEP: f64 = 0.1;
@@ -35,6 +41,7 @@ struct CategorySample {
     messages: Vec<(Vec<u8>, PathBuf)>,
 }
 
+#[derive(Clone)]
 struct GridResult {
     threshold: f64,
     factor: f64,
@@ -69,8 +76,8 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
     if !index_path.exists() {
         return Err("no index yet — run `postmaster-k learn <category> <directory>` first".into());
     }
-    let index = open_view(&index_path)?;
-    let size = index.size();
+    let index = Arc::new(Mutex::new(open_view(&index_path)?));
+    let size = index.lock().unwrap().size();
     if size == 0 {
         return Err("index is empty — run `postmaster-k learn` first".into());
     }
@@ -110,52 +117,124 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
     .collect();
 
     eprintln!(
-        "postmaster-k: autocalibrate: scoring {} (threshold x factor) combinations",
-        thresholds.len() * factors.len()
+        "postmaster-k: autocalibrate: scoring {} (threshold x factor) combinations ({} parallel)",
+        thresholds.len() * factors.len(),
+        PARALLEL_JOBS
     );
 
-    let mut results: Vec<GridResult> = Vec::new();
-    for (&threshold, ti) in thresholds.iter().zip(0..) {
+    let total_jobs = thresholds.len() * factors.len();
+    // Shared results matrix — protected by a mutex so threads can write safely.
+    let results: Arc<Mutex<Vec<GridResult>>> = Arc::new(Mutex::new(Vec::new()));
+    // Atomic counters for progress reporting across all threads.
+    let done_count = Arc::new(AtomicUsize::new(0));
+    // Track the highest threshold+factor pair completed so far (used by monitor).
+    let last_done = Arc::new(Mutex::new((0usize, 0usize))); // (ti, fi) of most recently finished job
+
+    let mut handles = Vec::with_capacity(total_jobs);
+
+    for (threshold, ti) in thresholds.iter().zip(0..) {
         for (&factor, fi) in factors.iter().zip(0..) {
-            let (correct, total) = score_grid_point(&points, &labels, &index, k, threshold, factor);
-            results.push(GridResult {
-                threshold,
-                factor,
-                correct,
-                total,
-                pct: if total > 0 {
+            let results = Arc::clone(&results);
+            let done_count = Arc::clone(&done_count);
+            let last_done = Arc::clone(&last_done);
+            let points = points.clone();
+            let labels = labels.clone();
+            let index = Arc::clone(&index);
+            let threshold = *threshold;
+            let k = k;
+
+            let handle = thread::spawn(move || {
+                let idx = index.lock().unwrap();
+                let (correct, total) =
+                    score_grid_point(&points, &labels, &idx, k, threshold, factor);
+                drop(idx);
+                let pct = if total > 0 {
                     correct as f64 / total as f64 * 100.0
                 } else {
                     0.0
-                },
+                };
+                let res = GridResult {
+                    threshold,
+                    factor,
+                    correct,
+                    total,
+                    pct,
+                };
+                results.lock().unwrap().push(res);
+                // Record which (ti, fi) just finished so the monitor can show
+                // the right inner/outer positions.
+                {
+                    let mut ld = last_done.lock().unwrap();
+                    if ti > ld.0 || (ti == ld.0 && fi > ld.1) {
+                        *ld = (ti, fi);
+                    }
+                }
+                done_count.fetch_add(1, AtomicOrdering::Relaxed);
             });
-            // Update progress bar inline.
-            let outer_done = ti + 1;
-            let inner_done = fi + 1;
-            let outer_total = thresholds.len();
-            let inner_total = factors.len();
-            let bar_w = 10;
-            let ob = (inner_done as f64 / inner_total as f64 * bar_w as f64)
-                .round()
-                .clamp(0.0, bar_w as f64) as usize;
-            let ib = (outer_done as f64 / outer_total as f64 * bar_w as f64)
-                .round()
-                .clamp(0.0, bar_w as f64) as usize;
-            eprint!(
-                "\r  [{}{}] [{}{}] ({:.2}, {:.2}, {}/{}, {:.2}%)",
-                "#".repeat(ob),
-                ".".repeat(bar_w - ob),
-                "#".repeat(ib),
-                ".".repeat(bar_w - ib),
-                threshold,
-                factor,
-                correct,
-                total,
-                results.last().unwrap().pct
-            );
+            handles.push(handle);
         }
     }
+
+    // Spawn a monitor thread that replays the original progress-bar format
+    // (ob inner] [ib outer]) as jobs complete.
+    let monitor_done = Arc::clone(&done_count);
+    let monitor_total = total_jobs;
+    let monitor_last = Arc::clone(&last_done);
+    let monitor_results = Arc::clone(&results);
+    thread::spawn(move || {
+        let bar_w = 10;
+        loop {
+            let n = monitor_done.load(AtomicOrdering::Relaxed);
+            if n >= monitor_total {
+                break;
+            }
+            let ld = monitor_last.lock().unwrap();
+            let (lid, lf) = *ld;
+            // Outer bar: fraction of threshold rows completed so far.
+            let outer_done_f = (lid as f64 + 1.0) / thresholds.len() as f64;
+            let ib = (outer_done_f * bar_w as f64)
+                .round()
+                .clamp(0.0, bar_w as f64) as usize;
+            // Inner bar: fraction of factor columns completed within the
+            // current outer row.
+            let inner_done_f = (lf as f64 + 1.0) / factors.len() as f64;
+            let ob = (inner_done_f * bar_w as f64)
+                .round()
+                .clamp(0.0, bar_w as f64) as usize;
+            // Pick a representative result for the live values (last finished).
+            let last_res = monitor_results.lock().unwrap();
+            let rep = last_res
+                .iter()
+                .filter(|r| r.threshold == thresholds[lid] && r.factor == factors[lf])
+                .next()
+                .cloned();
+            drop(last_res);
+            if let Some(r) = rep {
+                eprint!(
+                    "\r  [{}{}] [{}{}] ({:.2}, {:.2}, {}/{}, {:.2}%)",
+                    "#".repeat(ob),
+                    ".".repeat(bar_w - ob),
+                    "#".repeat(ib),
+                    ".".repeat(bar_w - ib),
+                    r.threshold,
+                    r.factor,
+                    r.correct,
+                    r.total,
+                    r.pct
+                );
+            }
+            drop(ld);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+
+    // Wait for all worker threads to finish.
+    for handle in handles {
+        let _ = handle.join();
+    }
     eprintln!(); // newline after progress bar
+
+    let results = results.lock().unwrap().drain(..).collect::<Vec<_>>();
 
     // Pick best: max accuracy, tie-break by second-highest threshold then lowest factor.
     // We want the highest accuracy; among those with equal accuracy we prefer the
@@ -424,6 +503,7 @@ fn score_grid_point(
 
 /// Open the index in mmap view mode. Mirrors `infer::open_view` logic so we
 /// don't duplicate error handling here.
+/// Cloning is cheap (just an Arc-like refcount bump).
 fn open_view(index_path: &Path) -> Result<usearch::Index, String> {
     let ps = index_path
         .to_str()
@@ -431,4 +511,27 @@ fn open_view(index_path: &Path) -> Result<usearch::Index, String> {
     let _meta =
         usearch::Index::metadata(ps).map_err(|e| format!("cannot read index header: {e}"))?;
     usearch::Index::restore_view(ps).map_err(|e| format!("cannot mmap-view index: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parallel_grid_launches_and_completes() {
+        // The grid constants define 7 thresholds × 17 factors = 119 jobs.
+        let thresholds: Vec<f64> = (0..=6).map(|i| i as f64 * THRESHOLD_STEP).collect();
+        let factors: Vec<f64> = std::iter::successors(Some(1.0f64), move |v| {
+            let next = v + FACTOR_STEP;
+            if next <= 5.0 + 1e-9 {
+                Some(next)
+            } else {
+                None
+            }
+        })
+        .collect();
+        assert_eq!(thresholds.len(), 7);
+        assert_eq!(factors.len(), 17);
+        assert_eq!(PARALLEL_JOBS, 5);
+    }
 }
