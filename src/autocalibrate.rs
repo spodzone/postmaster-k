@@ -109,10 +109,24 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
     })
     .collect();
 
+    eprintln!(
+        "postmaster-k: autocalibrate: scoring {} (threshold x factor) combinations",
+        thresholds.len() * factors.len()
+    );
+
     let mut results: Vec<GridResult> = Vec::new();
-    for &threshold in &thresholds {
-        for &factor in &factors {
+    for (&threshold, ti) in thresholds.iter().zip(0..) {
+        for (&factor, fi) in factors.iter().zip(0..) {
             let (correct, total) = score_grid_point(&points, &labels, &index, k, threshold, factor);
+            eprintln!(
+                "  [{:>4}/{:<4}] threshold={} factor={} -> {}/{} correct",
+                ti * factors.len() + fi + 1,
+                thresholds.len() * factors.len(),
+                fmt_f(threshold),
+                fmt_f(factor),
+                correct,
+                total
+            );
             results.push(GridResult {
                 threshold,
                 factor,
