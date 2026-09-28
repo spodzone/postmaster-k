@@ -118,15 +118,6 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
     for (&threshold, ti) in thresholds.iter().zip(0..) {
         for (&factor, fi) in factors.iter().zip(0..) {
             let (correct, total) = score_grid_point(&points, &labels, &index, k, threshold, factor);
-            eprintln!(
-                "  [{:>4}/{:<4}] threshold={} factor={} -> {}/{} correct",
-                ti * factors.len() + fi + 1,
-                thresholds.len() * factors.len(),
-                fmt_f(threshold),
-                fmt_f(factor),
-                correct,
-                total
-            );
             results.push(GridResult {
                 threshold,
                 factor,
@@ -138,38 +129,101 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
                     0.0
                 },
             });
+            // Update progress bar inline.
+            let outer_done = ti + 1;
+            let inner_done = fi + 1;
+            let outer_total = thresholds.len();
+            let inner_total = factors.len();
+            let bar_w = 10;
+            let ob = (inner_done as f64 / inner_total as f64 * bar_w as f64)
+                .round()
+                .clamp(0.0, bar_w as f64) as usize;
+            let ib = (outer_done as f64 / outer_total as f64 * bar_w as f64)
+                .round()
+                .clamp(0.0, bar_w as f64) as usize;
+            eprint!(
+                "\r  [{}{}] [{}{}] ({:.2}, {:.2}, {}/{}, {:.2}%)",
+                "#".repeat(ob),
+                ".".repeat(bar_w - ob),
+                "#".repeat(ib),
+                ".".repeat(bar_w - ib),
+                threshold,
+                factor,
+                correct,
+                total,
+                results.last().unwrap().pct
+            );
         }
     }
+    eprintln!(); // newline after progress bar
 
-    // Pick best: highest accuracy, breaking ties by lowest threshold then lowest factor.
-    results.sort_by(|a, b| {
-        b.correct
-            .cmp(&a.correct)
-            .then_with(|| {
-                a.threshold
-                    .partial_cmp(&b.threshold)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+    // Pick best: max accuracy, tie-break by second-highest threshold then lowest factor.
+    // We want the highest accuracy; among those with equal accuracy we prefer the
+    // threshold that is *second highest* (i.e. just below the peak) because lower
+    // thresholds are more permissive and still achieve the same top performance.
+    let max_correct = results.iter().map(|r| r.correct).max().unwrap_or(0);
+    let top_results: Vec<&GridResult> = results
+        .iter()
+        .filter(|r| r.correct == max_correct)
+        .collect();
+    // Sort by threshold descending, then factor ascending; pick the second if available.
+    let mut sorted: Vec<&GridResult> = top_results.clone();
+    sorted.sort_by(|a, b| {
+        a.threshold
+            .partial_cmp(&b.threshold)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .reverse()
             .then_with(|| {
                 a.factor
                     .partial_cmp(&b.factor)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
-    let best = results.first().expect("grid is non-empty");
+    let best = if sorted.len() > 1 {
+        sorted[1]
+    } else {
+        sorted[0]
+    };
 
     if std::io::stdout().is_terminal() {
         print_table(&results)?;
     } else {
         // Non-terminal: print a compact markdown table so it can be piped.
-        println!("| threshold | factor | %correct |");
-        println!("|----------:|-------:|---------:|");
+        // Compute widths for alignment.
+        let tw = results
+            .iter()
+            .map(|r| fmt_f(r.threshold).len())
+            .max()
+            .unwrap_or(7);
+        let fw = results
+            .iter()
+            .map(|r| fmt_f(r.factor).len())
+            .max()
+            .unwrap_or(6);
+        let pw = results
+            .iter()
+            .map(|r| format!("{:.1}", r.pct).len())
+            .max()
+            .unwrap_or(8);
+        println!(
+            "| {threshold:>tw$} | {factor:>fw$} | {:>pw$.1} |",
+            0.0,
+            threshold = "threshold",
+            factor = "factor",
+            tw = tw,
+            fw = fw,
+            pw = pw
+        );
+        println!("|{}|{}|{}|", "-".repeat(tw), "-".repeat(fw), "-".repeat(pw));
         for r in &results {
             println!(
-                "| {:>9} | {:>6} | {:>8.1} |",
+                "| {:>tw$} | {:>fw$} | {:>pw$.1} |",
                 fmt_f(r.threshold),
                 fmt_f(r.factor),
-                r.pct
+                r.pct,
+                tw = tw,
+                fw = fw,
+                pw = pw
             );
         }
         println!();
@@ -233,7 +287,12 @@ fn print_table(results: &[GridResult]) -> Result<(), String> {
         .max()
         .unwrap_or(8);
 
-    let _ = writeln!(handle, "| threshold | factor | %correct |");
+    // Header cells padded to column widths.
+    let hdr_thresh = format!("{:>width$}", "threshold", width = tw);
+    let hdr_factor = format!("{:>fw$}", "factor", fw = fw);
+    let hdr_pct = format!("{:>pw$.1}", 0.0, pw = pw);
+
+    let _ = writeln!(handle, "| {hdr_thresh} | {hdr_factor} | {hdr_pct} |");
     let sep = format!("|{}|{}|{}|", "-".repeat(tw), "-".repeat(fw), "-".repeat(pw));
     let _ = writeln!(handle, "{sep}");
     for r in results {
@@ -245,15 +304,15 @@ fn print_table(results: &[GridResult]) -> Result<(), String> {
             ts,
             fs,
             r.pct,
-            width = tw.max(ts.len()),
-            fw = fw.max(fs.len()),
+            width = tw,
+            fw = fw,
             pw = pw
         );
     }
     let _ = writeln!(handle);
     let _ = writeln!(
         handle,
-        "recommended: threshold = {} factor = {} ({}/{})",
+        "**recommended: threshold = {} factor = {}** ({}/{})",
         fmt_f(results[0].threshold),
         fmt_f(results[0].factor),
         results[0].correct,
