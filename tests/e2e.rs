@@ -99,7 +99,7 @@ fn learn_dir(home: &Path, category: &str, label: &str, msgs: &[(&str, &str)]) {
         )
         .unwrap();
     }
-    let out = learn::run(home, category, Some(dir.to_str().unwrap())).unwrap();
+    let out = learn::run(home, category, &[dir.to_str().unwrap().to_string()]).unwrap();
     assert!(
         out.contains(&format!("learned {}", msgs.len())),
         "learn said: {out}"

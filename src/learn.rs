@@ -19,17 +19,17 @@ use usearch::{new_index, Index, IndexOptions, MetricKind, ScalarKind};
 /// grow the file on every invocation.
 const SLACK: u64 = 256;
 
-pub fn run(home: &Path, category: &str, source: Option<&str>) -> Result<String, String> {
+pub fn run(home: &Path, category: &str, sources: &[String]) -> Result<String, String> {
     let cat = config::normalize_category(category)?;
-    // SPEC §8: `learn <cat> --` leaves clap's escape as the last arg, i.e.
-    // no source — treat "no source" the same as an explicit `-`: stdin.
-    let source = source.unwrap_or("-");
+    // SPEC §8: `learn <cat> --` makes clap consume the escape without
+    // yielding a value, i.e. no sources — same as an explicit `-`: stdin.
+    // `-` is only allowed as a lone source; it cannot be mixed with paths.
 
     let dims = config::settings(home)?.dims;
     let mut st = init_state(home, &cat)?;
 
-    let (files, from_stdin) = match source {
-        "-" => {
+    let (files, from_stdin) = match sources {
+        [] => {
             if std::io::stdin().is_terminal() {
                 return Err(
                     "stdin is a terminal: give a directory of messages, or pipe one through `-`"
@@ -38,7 +38,19 @@ pub fn run(home: &Path, category: &str, source: Option<&str>) -> Result<String, 
             }
             (Vec::new(), true)
         }
-        dir => (list_message_files(Path::new(dir))?, false),
+        [only] if only == "-" => {
+            if std::io::stdin().is_terminal() {
+                return Err(
+                    "stdin is a terminal: give a directory of messages, or pipe one through `-`"
+                        .into(),
+                );
+            }
+            (Vec::new(), true)
+        }
+        _ if sources.iter().any(|s| s == "-") => {
+            return Err("`-` (stdin) cannot be mixed with file or directory sources".into());
+        }
+        _ => (collect_message_files(sources)?, false),
     };
 
     // Only load()-mode user in the whole tool (SPEC §8).
@@ -203,25 +215,54 @@ fn learn_one(
     Ok(true)
 }
 
-fn list_message_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    if !dir.is_dir() {
+/// Resolve every `learn` source argument to a de-duplicated, sorted list of
+/// message files: each source may be a single file or a directory, which is
+/// walked recursively.
+fn collect_message_files(sources: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for src in sources {
+        collect_path(Path::new(src), &mut files)?;
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn collect_path(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let meta = fs::metadata(path)
+        .map_err(|e| format!("cannot stat `{}`: {e} (or `-` for stdin)", path.display()))?;
+    if meta.is_file() {
+        files.push(path.to_path_buf());
+    } else if meta.is_dir() {
+        walk_dir(path, 0, files)?;
+    } else {
         return Err(format!(
-            "`{}` is not a directory (or `-` for stdin)",
-            dir.display()
+            "`{}` is not a file or directory (or `-` for stdin)",
+            path.display()
         ));
     }
-    let mut files = Vec::new();
+    Ok(())
+}
+
+/// Guards against symlink loops (fs::metadata follows symlinks).
+const MAX_DEPTH: usize = 64;
+
+fn walk_dir(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    if depth > MAX_DEPTH {
+        return Err(format!("directory nesting too deep at `{}`", dir.display()));
+    }
     for entry in fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
         // metadata() follows symlinks; unreadable entries are skipped.
         let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
+        let path = entry.path();
+        if meta.is_file() {
+            files.push(path);
+        } else if meta.is_dir() {
+            walk_dir(&path, depth + 1, files)?;
         }
-        files.push(entry.path());
     }
-    files.sort();
-    Ok(files)
+    Ok(())
 }
 
 fn index_options(dims: usize) -> IndexOptions {

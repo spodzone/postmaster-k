@@ -33,8 +33,9 @@ enum Command {
     /// Learn messages into a category
     Learn {
         category: String,
-        /// Directory of one-message-per-file, or '-' to read one message from stdin
-        source: Option<String>,
+        /// Files or directories (walked recursively), one message per file;
+        /// '-' reads one message from stdin
+        sources: Vec<String>,
     },
     /// Classify one message (the procmail hot path)
     Infer {
@@ -77,11 +78,10 @@ fn main() {
 
     match cli.command {
         Command::Init => run(postmaster_k::config::init(&home)),
-        Command::Learn { category, source } => run(postmaster_k::learn::run(
-            &home,
-            &category,
-            source.as_deref(),
-        )),
+        Command::Learn {
+            category,
+            ref sources,
+        } => run(postmaster_k::learn::run(&home, &category, sources)),
         Command::Infer { mode, file, learn } => {
             let mode = match mode {
                 Mode::Word => postmaster_k::infer::Mode::Word,

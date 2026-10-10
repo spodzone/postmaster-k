@@ -169,8 +169,8 @@ pub fn settings(home: &Path) -> Result<Settings, String> {
     if !(0.0..=1.0).contains(&s.threshold) {
         return Err("config key `threshold` must be between 0.0 and 1.0".into());
     }
-    if s.threshold_factor <= 1.0 {
-        return Err("config key `threshold_factor` must be greater than 1.0".into());
+    if s.threshold_factor < 1.0 {
+        return Err("config key `threshold_factor` must be at least 1.0".into());
     }
     Ok(s)
 }
@@ -227,6 +227,21 @@ pub fn update_float(home: &Path, key: &str, value: f64) -> Result<(), String> {
         }
         Some(item) => {
             *item = Item::Value(value.into());
+        }
+    }
+    save_document(&loaded)
+}
+
+/// Update the usize value of `key` in config.toml in-place.
+pub fn update_usize(home: &Path, key: &str, value: usize) -> Result<(), String> {
+    let mut loaded = load_document(home)?;
+    match loaded.doc.get_mut(key) {
+        Some(Item::None) | None => {
+            let val: Value = (value as i64).into();
+            loaded.doc.insert(key, Item::Value(val));
+        }
+        Some(item) => {
+            *item = Item::Value((value as i64).into());
         }
     }
     save_document(&loaded)

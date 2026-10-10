@@ -176,7 +176,7 @@ step 3) gets turned on later.
 
 ## 8. CLI specification
 
-### `postmaster-k learn <category-name> <directory|-->`
+### `postmaster-k learn <category-name> <file-or-dir>...|-->`
 
 The required bootstrap phase, and also the ongoing incremental-correction
 mechanism — same command, same code path, whether you're seeding a brand
@@ -186,7 +186,9 @@ new category with a hundred examples or feeding it one corrected message.
 postmaster-k learn invoices ~/mail-examples/invoices/
 ```
 
-- Reads every file in `<directory>` as one message per file
+- Each source argument may be a single message file or a directory;
+  directories are walked **recursively**. Every file found is read as one
+  message per file
   (Maildir-style — not mbox, to keep parsing trivial), extracts
   classifiable text (§7.1), hashes it (§7), and inserts into the index
   tagged with `<category-name>`. Also updates `terms/invoices.db`.

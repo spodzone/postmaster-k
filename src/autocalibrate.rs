@@ -1,6 +1,6 @@
 //! The `autocalibrate` subcommand — sample a Maildir, score every example
-//! under a grid of `(threshold, threshold_factor)` pairs, and write the best
-//! combination back into config.toml.
+//! under a grid of `(dims, threshold, threshold_factor)` triples, and write the
+//! best combination back into config.toml.
 //!
 //! Sampling is max(20%, 200) per category with uniform random ordering so
 //! large categories aren't fully scored on every run while small ones still
@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 
 /// Minimum sample size per category so small Maildirs still get enough data.
@@ -22,13 +22,18 @@ const MIN_SAMPLES: usize = 200;
 /// Default fraction of each category to sample when the category is large.
 const SAMPLE_FRACTION: f64 = 0.20;
 
-/// Number of grid-search evaluations to run concurrently.
-const PARALLEL_JOBS: usize = 5;
+/// Number of grid-search evaluations to run concurrently: one less than the
+/// available CPU core count, so the autocalibrator doesn't starve the system.
+static PARALLEL_JOBS: LazyLock<usize> = LazyLock::new(|| num_cpus::get().saturating_sub(1).max(1));
 
 /// Grid step for `threshold`: 0.0, 0.1, …, 0.6.
 const THRESHOLD_STEP: f64 = 0.1;
 /// Grid step for `threshold_factor`: 1.0, 1.25, …, 5.0.
 const FACTOR_STEP: f64 = 0.25;
+/// Dims grid: powers of two from 64 to 65536.
+const DIMS_GRID: [usize; 11] = [
+    64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+];
 
 #[derive(Clone)]
 pub(crate) struct LabeledPoint {
@@ -41,8 +46,10 @@ struct CategorySample {
     messages: Vec<(Vec<u8>, PathBuf)>,
 }
 
+/// A single result from scoring one grid point.
 #[derive(Clone)]
 struct GridResult {
+    dims: usize,
     threshold: f64,
     factor: f64,
     correct: usize,
@@ -58,7 +65,7 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
     }
 
     let settings = config::settings(home)?;
-    let dims = settings.dims;
+    let _dims = settings.dims;
     let k = settings.k;
 
     let samples = discover_samples(maildir)?;
@@ -83,28 +90,7 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
     }
     let k = k.clamp(1, size as usize);
 
-    // Embed every sampled message into its vector. Keep vectors to avoid
-    // re-embedding across grid points.
-    let mut points: Vec<LabeledPoint> = Vec::new();
-    for sample in &samples {
-        for (raw, _path) in &sample.messages {
-            let txt = text::extract_bytes(raw).unwrap_or_default();
-            let counts = embed::token_counts(embed::tokenize(&txt).into_iter());
-            if counts.is_empty() {
-                continue;
-            }
-            let vec = embed::embed_counts(&counts, dims);
-            points.push(LabeledPoint {
-                category: sample.category.clone(),
-                vec,
-            });
-        }
-    }
-    if points.is_empty() {
-        return Err("no classifiable messages found in any category".into());
-    }
-
-    // Grid search.
+    // Grid search over (dims, threshold, factor).
     let thresholds: Vec<f64> = (0..=6).map(|i| i as f64 * THRESHOLD_STEP).collect();
     let factors: Vec<f64> = std::iter::successors(Some(1.0f64), move |v| {
         let next = v + FACTOR_STEP;
@@ -117,66 +103,93 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
     .collect();
 
     eprintln!(
-        "postmaster-k: autocalibrate: scoring {} (threshold x factor) combinations ({} parallel)",
-        thresholds.len() * factors.len(),
-        PARALLEL_JOBS
+        "postmaster-k: autocalibrate: scoring {} (dims x threshold x factor) combinations ({} parallel)",
+        DIMS_GRID.len() * thresholds.len() * factors.len(),
+        *PARALLEL_JOBS
     );
 
-    let total_jobs = thresholds.len() * factors.len();
+    let total_jobs = DIMS_GRID.len() * thresholds.len() * factors.len();
     // Shared results matrix — protected by a mutex so threads can write safely.
     let results: Arc<Mutex<Vec<GridResult>>> = Arc::new(Mutex::new(Vec::new()));
     // Atomic counters for progress reporting across all threads.
     let done_count = Arc::new(AtomicUsize::new(0));
-    // Track the highest threshold+factor pair completed so far (used by monitor).
-    let last_done = Arc::new(Mutex::new((0usize, 0usize))); // (ti, fi) of most recently finished job
+    // Track the highest (di, ti, fi) completed so far (used by monitor).
+    let last_done = Arc::new(Mutex::new((0usize, 0usize, 0usize))); // (di, ti, fi)
 
     let mut handles = Vec::with_capacity(total_jobs);
 
-    for (threshold, ti) in thresholds.iter().zip(0..) {
-        for (&factor, fi) in factors.iter().zip(0..) {
-            let results = Arc::clone(&results);
-            let done_count = Arc::clone(&done_count);
-            let last_done = Arc::clone(&last_done);
-            let points = points.clone();
-            let labels = labels.clone();
-            let index = Arc::clone(&index);
-            let threshold = *threshold;
-            let k = k;
-
-            let handle = thread::spawn(move || {
-                let idx = index.lock().unwrap();
-                let (correct, total) =
-                    score_grid_point(&points, &labels, &idx, k, threshold, factor);
-                drop(idx);
-                let pct = if total > 0 {
-                    correct as f64 / total as f64 * 100.0
-                } else {
-                    0.0
-                };
-                let res = GridResult {
-                    threshold,
-                    factor,
-                    correct,
-                    total,
-                    pct,
-                };
-                results.lock().unwrap().push(res);
-                // Record which (ti, fi) just finished so the monitor can show
-                // the right inner/outer positions.
-                {
-                    let mut ld = last_done.lock().unwrap();
-                    if ti > ld.0 || (ti == ld.0 && fi > ld.1) {
-                        *ld = (ti, fi);
-                    }
+    for (dims, di) in DIMS_GRID.iter().zip(0..) {
+        // Re-embed points at this dims value.
+        let points: Vec<LabeledPoint> = samples
+            .iter()
+            .flat_map(|sample| &sample.messages)
+            .filter_map(|(raw, _path)| {
+                let txt = text::extract_bytes(raw).unwrap_or_default();
+                let counts = embed::token_counts(embed::tokenize(&txt).into_iter());
+                if counts.is_empty() {
+                    return None;
                 }
-                done_count.fetch_add(1, AtomicOrdering::Relaxed);
-            });
-            handles.push(handle);
+                Some(LabeledPoint {
+                    category: samples[di % samples.len()].category.clone(),
+                    vec: embed::embed_counts(&counts, *dims),
+                })
+            })
+            .collect();
+        if points.is_empty() {
+            continue;
+        }
+
+        for (threshold, ti) in thresholds.iter().zip(0..) {
+            for (&factor, fi) in factors.iter().zip(0..) {
+                let results = Arc::clone(&results);
+                let done_count = Arc::clone(&done_count);
+                let last_done = Arc::clone(&last_done);
+                let points = points.clone();
+                let labels = labels.clone();
+                let index = Arc::clone(&index);
+                let threshold = *threshold;
+                let factor = factor;
+                let dims = *dims;
+                let k = k;
+
+                let handle = thread::spawn(move || {
+                    let idx = index.lock().unwrap();
+                    let (correct, total) =
+                        score_grid_point(&points, &labels, &idx, k, threshold, factor);
+                    drop(idx);
+                    let pct = if total > 0 {
+                        correct as f64 / total as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    let res = GridResult {
+                        dims,
+                        threshold,
+                        factor,
+                        correct,
+                        total,
+                        pct,
+                    };
+                    results.lock().unwrap().push(res);
+                    // Record which (di, ti, fi) just finished so the monitor can show
+                    // the right positions.
+                    {
+                        let mut ld = last_done.lock().unwrap();
+                        if di > ld.0
+                            || (di == ld.0 && ti > ld.1)
+                            || (di == ld.0 && ti == ld.1 && fi > ld.2)
+                        {
+                            *ld = (di, ti, fi);
+                        }
+                    }
+                    done_count.fetch_add(1, AtomicOrdering::Relaxed);
+                });
+                handles.push(handle);
+            }
         }
     }
 
-    // Spawn a monitor thread that replays the original progress-bar format
-    // (ob inner] [ib outer]) as jobs complete.
+    // Spawn a monitor thread that shows progress across all three dimensions.
     let monitor_done = Arc::clone(&done_count);
     let monitor_total = total_jobs;
     let monitor_last = Arc::clone(&last_done);
@@ -189,33 +202,42 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
                 break;
             }
             let ld = monitor_last.lock().unwrap();
-            let (lid, lf) = *ld;
-            // Outer bar: fraction of threshold rows completed so far.
-            let outer_done_f = (lid as f64 + 1.0) / thresholds.len() as f64;
-            let ib = (outer_done_f * bar_w as f64)
+            let (ldi, lti, lfi) = *ld;
+            // Outer bar: fraction of dims values completed.
+            let outer_done_f = (ldi as f64 + 1.0) / DIMS_GRID.len() as f64;
+            let ob = (outer_done_f * bar_w as f64)
                 .round()
                 .clamp(0.0, bar_w as f64) as usize;
-            // Inner bar: fraction of factor columns completed within the
-            // current outer row.
-            let inner_done_f = (lf as f64 + 1.0) / factors.len() as f64;
-            let ob = (inner_done_f * bar_w as f64)
+            // Middle bar: fraction of threshold rows completed within current dims.
+            let mid_done_f = (lti as f64 + 1.0) / thresholds.len() as f64;
+            let mb = (mid_done_f * bar_w as f64).round().clamp(0.0, bar_w as f64) as usize;
+            // Inner bar: fraction of factor columns completed within current row.
+            let inner_done_f = (lfi as f64 + 1.0) / factors.len() as f64;
+            let ib = (inner_done_f * bar_w as f64)
                 .round()
                 .clamp(0.0, bar_w as f64) as usize;
             // Pick a representative result for the live values (last finished).
             let last_res = monitor_results.lock().unwrap();
             let rep = last_res
                 .iter()
-                .filter(|r| r.threshold == thresholds[lid] && r.factor == factors[lf])
+                .filter(|r| {
+                    r.dims == DIMS_GRID[ldi]
+                        && r.threshold == thresholds[lti]
+                        && r.factor == factors[lfi]
+                })
                 .next()
                 .cloned();
             drop(last_res);
             if let Some(r) = rep {
                 eprint!(
-                    "\r  [{}{}] [{}{}] ({:.2}, {:.2}, {}/{}, {:.2}%)",
+                    "\r  [{}{}] [{}{}] [{}{}] (dims={}, {:.2}, {:.2}, {}/{}, {:.2}%)",
                     "#".repeat(ob),
                     ".".repeat(bar_w - ob),
+                    "#".repeat(mb),
+                    ".".repeat(bar_w - mb),
                     "#".repeat(ib),
                     ".".repeat(bar_w - ib),
+                    r.dims,
                     r.threshold,
                     r.factor,
                     r.correct,
@@ -269,6 +291,11 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
     } else {
         // Non-terminal: print a compact markdown table so it can be piped.
         // Compute widths for alignment.
+        let dw = results
+            .iter()
+            .map(|r| format!("{}", r.dims).len())
+            .max()
+            .unwrap_or(6);
         let tw = results
             .iter()
             .map(|r| fmt_f(r.threshold).len())
@@ -285,21 +312,31 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
             .max()
             .unwrap_or(8);
         println!(
-            "| {threshold:>tw$} | {factor:>fw$} | {:>pw$.1} |",
+            "| {dims:>dw$} | {threshold:>tw$} | {factor:>fw$} | {:>pw$.1} |",
             0.0,
+            dims = "dims",
             threshold = "threshold",
             factor = "factor",
+            dw = dw,
             tw = tw,
             fw = fw,
             pw = pw
         );
-        println!("|{}|{}|{}|", "-".repeat(tw), "-".repeat(fw), "-".repeat(pw));
+        println!(
+            "|{}|{}|{}|{}|",
+            "-".repeat(dw),
+            "-".repeat(tw),
+            "-".repeat(fw),
+            "-".repeat(pw)
+        );
         for r in &results {
             println!(
-                "| {:>tw$} | {:>fw$} | {:>pw$.1} |",
+                "| {:>dw$} | {:>tw$} | {:>fw$} | {:>pw$.1} |",
+                r.dims,
                 fmt_f(r.threshold),
                 fmt_f(r.factor),
                 r.pct,
+                dw = dw,
                 tw = tw,
                 fw = fw,
                 pw = pw
@@ -307,7 +344,8 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
         }
         println!();
         println!(
-            "**recommended: threshold = {}, factor = {}** ({}/{})",
+            "**recommended: dims = {}, threshold = {}, factor = {}** ({}/{})",
+            best.dims,
             fmt_f(best.threshold),
             fmt_f(best.factor),
             best.correct,
@@ -319,8 +357,11 @@ pub fn run(maildir: &Path, home: &Path) -> Result<(f64, f64), String> {
         .map_err(|e| format!("cannot write config: {e}"))?;
     config::update_float(home, "threshold_factor", best.factor)
         .map_err(|e| format!("cannot write config: {e}"))?;
+    config::update_usize(home, "dims", best.dims)
+        .map_err(|e| format!("cannot write config: {e}"))?;
     eprintln!(
-        "postmaster-k: wrote threshold={} factor={} into {}",
+        "postmaster-k: wrote dims={} threshold={} factor={} into {}",
+        best.dims,
         fmt_f(best.threshold),
         fmt_f(best.factor),
         config::config_path(home).display()
@@ -350,6 +391,11 @@ fn print_table(results: &[GridResult]) -> Result<(), String> {
     let mut handle = stdout.lock();
 
     // Compute column widths from all rows using formatted values.
+    let dw = results
+        .iter()
+        .map(|r| format!("{}", r.dims).len())
+        .max()
+        .unwrap_or(6);
     let tw = results
         .iter()
         .map(|r| fmt_f(r.threshold).len())
@@ -367,35 +413,72 @@ fn print_table(results: &[GridResult]) -> Result<(), String> {
         .unwrap_or(8);
 
     // Header cells padded to column widths.
+    let hdr_dims = format!("{:>width$}", "dims", width = dw);
     let hdr_thresh = format!("{:>width$}", "threshold", width = tw);
     let hdr_factor = format!("{:>fw$}", "factor", fw = fw);
     let hdr_pct = format!("{:>pw$.1}", 0.0, pw = pw);
 
-    let _ = writeln!(handle, "| {hdr_thresh} | {hdr_factor} | {hdr_pct} |");
-    let sep = format!("|{}|{}|{}|", "-".repeat(tw), "-".repeat(fw), "-".repeat(pw));
+    let _ = writeln!(
+        handle,
+        "| {hdr_dims} | {hdr_thresh} | {hdr_factor} | {hdr_pct} |"
+    );
+    let sep = format!(
+        "|{}|{}|{}|{}|",
+        "-".repeat(dw),
+        "-".repeat(tw),
+        "-".repeat(fw),
+        "-".repeat(pw)
+    );
     let _ = writeln!(handle, "{sep}");
     for r in results {
+        let ds = format!("{}", r.dims);
         let ts = fmt_f(r.threshold);
         let fs = fmt_f(r.factor);
         let _ = writeln!(
             handle,
-            "| {:>width$} | {:>fw$} | {:>pw$.1} |",
+            "| {:>width$} | {:>fw$} | {:>fw2$} | {:>pw$.1} |",
+            ds,
             ts,
             fs,
             r.pct,
-            width = tw,
+            width = dw,
             fw = fw,
+            fw2 = fw,
             pw = pw
         );
     }
     let _ = writeln!(handle);
+    // Find best result: max accuracy, tie-break by second-highest threshold then lowest factor.
+    let max_correct = results.iter().map(|r| r.correct).max().unwrap_or(0);
+    let top_results: Vec<&GridResult> = results
+        .iter()
+        .filter(|r| r.correct == max_correct)
+        .collect();
+    let mut sorted: Vec<&GridResult> = top_results.clone();
+    sorted.sort_by(|a, b| {
+        a.threshold
+            .partial_cmp(&b.threshold)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .reverse()
+            .then_with(|| {
+                a.factor
+                    .partial_cmp(&b.factor)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let best = if sorted.len() > 1 {
+        sorted[1]
+    } else {
+        sorted[0]
+    };
     let _ = writeln!(
         handle,
-        "**recommended: threshold = {} factor = {}** ({}/{})",
-        fmt_f(results[0].threshold),
-        fmt_f(results[0].factor),
-        results[0].correct,
-        results[0].total
+        "**recommended: dims = {}, threshold = {} factor = {}** ({}/{})",
+        best.dims,
+        fmt_f(best.threshold),
+        fmt_f(best.factor),
+        best.correct,
+        best.total
     );
     handle
         .flush()
@@ -519,7 +602,8 @@ mod tests {
 
     #[test]
     fn test_parallel_grid_launches_and_completes() {
-        // The grid constants define 7 thresholds × 17 factors = 119 jobs.
+        // The grid constants define 11 dims × 7 thresholds × 17 factors = 1309 jobs.
+        assert_eq!(DIMS_GRID.len(), 11);
         let thresholds: Vec<f64> = (0..=6).map(|i| i as f64 * THRESHOLD_STEP).collect();
         let factors: Vec<f64> = std::iter::successors(Some(1.0f64), move |v| {
             let next = v + FACTOR_STEP;
@@ -532,6 +616,6 @@ mod tests {
         .collect();
         assert_eq!(thresholds.len(), 7);
         assert_eq!(factors.len(), 17);
-        assert_eq!(PARALLEL_JOBS, 5);
+        assert!(*PARALLEL_JOBS >= 1);
     }
 }

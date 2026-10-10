@@ -53,7 +53,7 @@ The tunable knobs are in `config.toml` at that root:
 | `dims` | `2048` | `64`–`1048576` | Feature‑hash vector dimensionality. Higher = finer vocabulary resolution, bigger index. |
 | `k` | `15` | `1`–`4096` | Nearest neighbours consulted per inference. |
 | `threshold` | `0.4` | `0.0`–`1.0` | Minimum vote **share** a category must reach to win (else the result is `unsure`). |
-| `threshold_factor` | `2.0` | `> 1.0` | The winner's vote weight must be at least this many × the runner‑up's (enforces a clear drop‑off). |
+| `threshold_factor` | `2.0` | `>= 1.0` | The winner's vote weight must be at least this many × the runner‑up's (enforces a clear drop‑off). |
 
 **`threshold`** — the winning category's share of the total vote weight, `0.0`–`1.0`. Anything below it is classed `unsure` rather than delivered. Raise it to push more ambiguous mail to manual sorting; lower it if too much ends up in `unsure`.
 
