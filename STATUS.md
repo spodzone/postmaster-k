@@ -63,6 +63,10 @@ never run on a real runner.
 - `learn` saves the index via tmp-file + rename; a crash mid-learn cannot
   corrupt `index.usearch`. Categories are registered in `config.toml` only
   after the batch yields ≥1 vector.
+- Persist order is side-tables first, index last, so a killed/failed write
+  leaves dangling labels (harmless) rather than index vectors missing from
+  `labels.db`. Should the index ever get ahead anyway, `learn` skips keys
+  the index already occupies and starts new vectors above them.
 - `unsure` is a reserved category name; user categories are `[a-z0-9_-]`.
 
 ## Open questions (SPEC §11, still open)

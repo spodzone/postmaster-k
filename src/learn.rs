@@ -124,27 +124,43 @@ fn init_state(home: &Path, cat: &str) -> Result<LearnState, String> {
         next_key: 0,
         learned: 0,
         skipped: 0,
+        orphans: 0,
     };
     st.next_key = store::next_key(&st.labels);
     Ok(st)
 }
 
-/// Persist one completed learn batch: register the category, save the index
-/// (tmp+rename), then the side-tables. Returns the human summary.
+/// Persist one completed learn batch: register the category, then the
+/// side-tables, then the index. Returns the human summary.
 fn persist(home: &Path, cat: &str, index: &Index, st: &LearnState) -> Result<String, String> {
     // Register the category only once learning actually produced something.
     if config::add_category(home, cat)? {
         eprintln!("postmaster-k: created category `{cat}`");
     }
 
-    // Persist: index first (tmp+rename), then side-tables. If a side-table
-    // write fails, the index may briefly contain unlabelled vectors;
-    // `infer` skips unknown keys with a warning instead of guessing.
-    save_index(index, &config::index_path(home))?;
+    // Persist: side-tables first, index last. If a side-table write fails,
+    // the index save never happens and the whole batch can simply be re-run.
+    // If the index save fails after the side-tables were written, labels.db
+    // briefly references keys the index doesn't have — harmless, because
+    // `infer` resolves labels only for keys a search actually returns, and
+    // the next `learn` resumes above the gap. (Writing the index first would
+    // orphan its vectors on a failed side-table write instead, and every
+    // later `learn` would then collide with those keys and refuse to run.)
     store::store_labels(&config::labels_path(home), &st.labels)
         .map_err(|e| format!("cannot write {}: {e}", config::labels_path(home).display()))?;
     store::store_terms(&config::terms_path(home, cat), &st.terms)
         .map_err(|e| format!("cannot write term table: {e}"))?;
+    save_index(index, &config::index_path(home))?;
+
+    if st.orphans > 0 {
+        eprintln!(
+            "postmaster-k: warning: index held {} vector{} missing from labels.db; \
+             new vectors start at key {} — those orphans are ignored by `infer`",
+            st.orphans,
+            if st.orphans == 1 { "" } else { "s" },
+            st.next_key,
+        );
+    }
 
     Ok(format!(
         "learned {} message{} into `{cat}` (index now {} vector{}, skipped {})",
@@ -162,6 +178,9 @@ struct LearnState {
     next_key: u64,
     learned: u64,
     skipped: u64,
+    /// Keys bumped past because the index already held them but labels.db
+    /// didn't: orphaned vectors from an earlier interrupted persist.
+    orphans: u64,
 }
 
 fn ingest(
@@ -172,6 +191,13 @@ fn ingest(
     dims: usize,
     st: &mut LearnState,
 ) -> Result<(), String> {
+    // labels.db may lag the index (a prior persist died between its two
+    // writes), so a key labels.db considers free can already be occupied.
+    // Skip those rather than failing the run; count them for the summary.
+    while index.count(st.next_key) > 0 {
+        st.next_key += 1;
+        st.orphans += 1;
+    }
     match learn_one(index, raw, st.next_key, dims, &mut st.terms) {
         Ok(true) => {
             st.labels.push(store::LabelEntry {
@@ -348,5 +374,67 @@ mod tests {
         assert!(terms.contains_key("invoice"));
         assert!(terms.contains_key("amount"));
         assert!(!terms.contains_key("the")); // stopword
+    }
+
+    /// labels.db lagging behind the index (interrupted persist) must not
+    /// wedge learning: ingest skips the occupied keys instead of failing.
+    /// Exercises a save→restore round-trip since that's how `learn` opens
+    /// an existing index.
+    #[test]
+    fn ingest_skips_keys_orphaned_in_index() {
+        let dims = 256;
+        let dir = std::env::temp_dir().join(format!(
+            "pmk-learn-orphans-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.usearch");
+
+        // Simulate the divergence: the index holds vector 5, labels.db only
+        // knows keys up to 4, so next_key = 5 collides.
+        let raw = b"Subject: invoice due\n\nPlease pay the amount on the invoice.\n";
+        {
+            let index = new_index(&index_options(dims)).unwrap();
+            index.reserve(10).unwrap();
+            let mut terms = store::TermMap::new();
+            assert!(learn_one(&index, raw, 5, dims, &mut terms).unwrap());
+            index.save(path.to_str().unwrap()).unwrap();
+        }
+
+        let index = Index::restore(path.to_str().unwrap()).unwrap();
+        assert_eq!(index.count(5), 1);
+        assert_eq!(index.count(6), 0);
+        // `open_for_learning` always tops up capacity before inserting.
+        index.reserve(index.size() + 10).unwrap();
+
+        let mut st = LearnState {
+            labels: vec![
+                store::LabelEntry {
+                    key: 3,
+                    category: "a".into(),
+                    source: None,
+                },
+                store::LabelEntry {
+                    key: 4,
+                    category: "a".into(),
+                    source: None,
+                },
+            ],
+            terms: store::load_terms(&dir.join("terms.db")).unwrap(),
+            next_key: 5,
+            learned: 0,
+            skipped: 0,
+            orphans: 0,
+        };
+        ingest(&index, raw, None, "a", dims, &mut st).unwrap();
+
+        assert_eq!(st.orphans, 1);
+        assert_eq!(st.learned, 1);
+        // Bumped past the occupied 5, learned into 6, then advanced to 7.
+        assert_eq!(st.next_key, 7);
+        assert_eq!(st.labels.last().unwrap().key, 6);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
